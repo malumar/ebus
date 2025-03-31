@@ -35,7 +35,7 @@ err := bus.Publish(ctx, []ebus.Payload[AppCtx]{
 })
 ```
 
-For more exaples look into ebus_test.go
+For more examples look into [ebus_test.go](./ebus_test.go)
 
 #### With result:
 
