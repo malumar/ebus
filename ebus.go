@@ -1,5 +1,6 @@
 // Package ebus provides a generic event bus with support for transactional dispatching,
 // middleware, and payload lifecycle (validate, handle, commit, rollback).
+// author Marcin Maluszczak
 package ebus
 
 import (

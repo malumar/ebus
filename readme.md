@@ -23,8 +23,6 @@ Designed to be clean, flexible, and generic using Go's type parameters.
 go get github.com/malumar/ebus
 ```
 
-> Replace `your-username` with your actual GitHub handle or module path.
-
 ---
 
 ### 🚀 Quick Example
