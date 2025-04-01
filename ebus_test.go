@@ -5,7 +5,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"math/rand"
+	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -309,4 +311,348 @@ func TestBus_Subscribe(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, multiplier*val, simpleCtx.GetValue(val),
 		"multiplier should be equal")
+}
+
+type dummyCtx struct{}
+
+type dummyPayload struct{}
+
+func (d *dummyPayload) Validate(ctx dummyCtx) error { return nil }
+func (d *dummyPayload) Commit(ctx dummyCtx)         {}
+func (d *dummyPayload) Rollback(ctx dummyCtx)       {}
+func (d *dummyPayload) PayloadType() PayloadType    { return 0 }
+func (d *dummyPayload) Handle(ctx dummyCtx) error   { return nil }
+
+// TestRetryMiddleware_SucceedsAfterRetries checks that the handler passes after several
+// failed attempts.
+func TestRetryMiddleware_SucceedsAfterRetries(t *testing.T) {
+	attempts := 0
+	handler := func(ctx dummyCtx, event *Event[dummyCtx, int]) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("temporary failure")
+		}
+		return nil
+	}
+
+	event := &Event[dummyCtx, int]{
+		ID:       1,
+		Payloads: []Payload[dummyCtx]{&dummyPayload{}},
+	}
+
+	mw := Retry[dummyCtx, int](5, 10*time.Millisecond)
+	err := mw(handler)(dummyCtx{}, event)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, attempts)
+}
+
+// TestRetryMiddleware_FailsAfterMaxRetries It checks that when the limit is reached,
+// the middleware returns an error.
+func TestRetryMiddleware_FailsAfterMaxRetries(t *testing.T) {
+	attempts := 0
+	handler := func(ctx dummyCtx, event *Event[dummyCtx, int]) error {
+		attempts++
+		return errors.New("always fails")
+	}
+
+	event := &Event[dummyCtx, int]{
+		ID:       2,
+		Payloads: []Payload[dummyCtx]{&dummyPayload{}},
+	}
+
+	mw := Retry[dummyCtx, int](3, 5*time.Millisecond)
+	err := mw(handler)(dummyCtx{}, event)
+	assert.Error(t, err)
+	assert.Equal(t, 3, attempts)
+}
+
+type testCtx struct{}
+
+type testPayload struct {
+	payloadType PayloadType
+}
+
+func (p *testPayload) Validate(testCtx) error   { return nil }
+func (p *testPayload) Commit(testCtx)           {}
+func (p *testPayload) Handle(testCtx) error     { return nil }
+func (p *testPayload) Rollback(testCtx)         {}
+func (p *testPayload) PayloadType() PayloadType { return p.payloadType }
+
+func TestLoggingById(t *testing.T) {
+	var logs []string
+	logger := func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		t.Logf("add line: %s\n", line)
+		logs = append(logs, line)
+	}
+
+	event := &Event[testCtx, int]{
+		ID:       123,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 1}},
+	}
+
+	logged := LoggingById[testCtx, int](logger)(func(ctx testCtx, e *Event[testCtx, int]) error {
+		return nil
+	})
+
+	err := logged(testCtx{}, event)
+	assert.NoError(t, err)
+	assert.Condition(t, func() bool {
+		for _, l := range logs {
+			if strings.Contains(l, "Payload type: 1") {
+				return true
+			}
+		}
+		return false
+	}, "should log numeric payload type")
+}
+
+func TestLoggingByTypeName(t *testing.T) {
+	var logs []string
+	logger := func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		t.Logf("add line: %s\n", line)
+		logs = append(logs, line)
+	}
+
+	nameMap := map[PayloadType]string{
+		1: "CustomType",
+	}
+
+	nameHandler := func(pt PayloadType) string {
+		if n, ok := nameMap[pt]; ok {
+			return n
+		}
+		return "Unknown"
+	}
+
+	event := &Event[testCtx, int]{
+		ID:       456,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 1}},
+	}
+
+	logged := LoggingByTypeName[testCtx, int](nameHandler, logger)(func(ctx testCtx, e *Event[testCtx, int]) error {
+		return nil
+	})
+
+	err := logged(testCtx{}, event)
+	assert.NoError(t, err)
+	assert.Condition(t, func() bool {
+		for _, l := range logs {
+			if strings.Contains(l, "Payload type: CustomType") {
+				return true
+			}
+		}
+		return false
+	}, "should log named payload type")
+}
+
+type testRetryPolicy struct {
+	max   int
+	delay time.Duration
+}
+
+func (r *testRetryPolicy) ShouldRetry(attempt int, err error) bool {
+	return attempt < r.max-1
+}
+
+func (r *testRetryPolicy) Backoff(attempt int) time.Duration {
+	return r.delay * time.Duration(attempt)
+}
+
+func TestRetryWithFallback_CallsFallbackOnFailure(t *testing.T) {
+	failErr := errors.New("fail")
+	calls := 0
+	fallbackCalled := false
+	maxCalls := 4
+	policy := &testRetryPolicy{max: maxCalls, delay: 5 * time.Millisecond}
+
+	handler := func(ctx testCtx, evt *Event[testCtx, int]) error {
+		calls++
+		t.Logf("handler call no %d\n", calls)
+		return failErr
+	}
+
+	fallback := func(evt *Event[testCtx, int], err error) {
+		fallbackCalled = true
+		t.Logf("fallback called, calls %d\n", calls)
+		assert.Equal(t, failErr, err)
+		assert.Equal(t, 99, evt.ID)
+	}
+
+	evt := &Event[testCtx, int]{
+		ID:       99,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 7}},
+	}
+
+	mw := RetryWithFallback[testCtx, int](policy, fallback)(handler)
+	err := mw(testCtx{}, evt)
+
+	assert.Equal(t, failErr, err)
+	assert.Equal(t, maxCalls, calls)
+	assert.True(t, fallbackCalled)
+}
+
+func TestRetryWithFallback_SkipsFallbackOnSuccess(t *testing.T) {
+	called := 0
+	maxCalls := 3
+	policy := &testRetryPolicy{max: maxCalls, delay: 5 * time.Millisecond}
+	fallbackCalled := false
+
+	handler := func(ctx testCtx, evt *Event[testCtx, int]) error {
+		called++
+		t.Logf("handler call no  %d\n", called)
+		return nil
+	}
+
+	fallback := func(evt *Event[testCtx, int], err error) {
+		// This cannot happen
+		fallbackCalled = true
+		t.Logf("fallback called, calls %d\n", called)
+	}
+
+	evt := &Event[testCtx, int]{
+		ID:       10,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 5}},
+	}
+
+	mw := RetryWithFallback[testCtx, int](policy, fallback)(handler)
+	err := mw(testCtx{}, evt)
+
+	fmt.Println(called)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, called)
+	assert.False(t, fallbackCalled)
+}
+
+type countedRetryPolicy struct {
+	max   int
+	delay time.Duration
+	log   []int // keeps track of attempt indexes
+}
+
+func (r *countedRetryPolicy) ShouldRetry(attempt int, err error) bool {
+	r.log = append(r.log, attempt)
+	return attempt < r.max-1
+}
+
+func (r *countedRetryPolicy) Backoff(attempt int) time.Duration {
+	return r.delay
+}
+
+func TestRetryWithPolicy_SucceedsAfterRetries(t *testing.T) {
+	failErr := errors.New("fail")
+	calls := 0
+	maxCalls := 3
+	policy := &countedRetryPolicy{max: maxCalls, delay: 10 * time.Millisecond}
+
+	handler := func(ctx testCtx, evt *Event[testCtx, int]) error {
+		calls++
+		t.Logf("handler call no  %d\n", calls)
+		if calls < 3 {
+			return failErr
+		}
+		return nil
+	}
+
+	evt := &Event[testCtx, int]{
+		ID:       11,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 8}},
+	}
+
+	mw := RetryWithPolicy[testCtx, int](policy)(handler)
+	err := mw(testCtx{}, evt)
+
+	assert.NoError(t, err)
+	assert.Equal(t, maxCalls, calls)
+	assert.Equal(t, []int{0, 1}, policy.log)
+}
+
+func TestRetryWithPolicy_GivesUpAfterMaxRetries(t *testing.T) {
+	failErr := errors.New("fail again")
+	maxCalls := 3
+	calls := 0
+	policy := &countedRetryPolicy{max: maxCalls, delay: 10 * time.Millisecond}
+
+	handler := func(ctx testCtx, evt *Event[testCtx, int]) error {
+		calls++
+		t.Logf("handler call no  %d\n", calls)
+
+		return failErr
+	}
+
+	evt := &Event[testCtx, int]{
+		ID:       12,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 9}},
+	}
+
+	mw := RetryWithPolicy[testCtx, int](policy)(handler)
+	err := mw(testCtx{}, evt)
+
+	assert.Equal(t, failErr, err)
+	assert.Equal(t, maxCalls, calls) // initial try + 2 retries
+	assert.Equal(t, []int{0, 1, 2}, policy.log)
+}
+
+func TestWithEventHooks_BothHooksAreCalled(t *testing.T) {
+	var beforeCalled, afterCalled bool
+
+	hooks := EventHooks[testCtx, int]{
+		OnBeforeHandle: func(ctx testCtx, evt *Event[testCtx, int]) {
+			t.Logf("before handle called %d\n", evt.ID)
+			beforeCalled = true
+		},
+		OnAfterCommit: func(ctx testCtx, evt *Event[testCtx, int]) {
+			t.Logf("after commit called %d\n", evt.ID)
+			afterCalled = true
+		},
+	}
+
+	evt := &Event[testCtx, int]{
+		ID:       21,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 1}},
+	}
+
+	handler := func(ctx testCtx, evt *Event[testCtx, int]) error {
+		t.Logf("handler called %d\n", evt.ID)
+		return nil
+	}
+
+	mw := WithEventHooks(hooks)(handler)
+	err := mw(testCtx{}, evt)
+
+	assert.NoError(t, err)
+	assert.True(t, beforeCalled)
+	assert.True(t, afterCalled)
+}
+
+func TestWithEventHooks_OnlyBeforeCalledOnFailure(t *testing.T) {
+	var beforeCalled, afterCalled bool
+
+	hooks := EventHooks[testCtx, int]{
+		OnBeforeHandle: func(ctx testCtx, evt *Event[testCtx, int]) {
+			t.Logf("before handle called %d\n", evt.ID)
+			beforeCalled = true
+		},
+		OnAfterCommit: func(ctx testCtx, evt *Event[testCtx, int]) {
+			t.Logf("after commit called %d\n", evt.ID)
+			afterCalled = true
+		},
+	}
+
+	evt := &Event[testCtx, int]{
+		ID:       22,
+		Payloads: []Payload[testCtx]{&testPayload{payloadType: 2}},
+	}
+
+	handler := func(ctx testCtx, evt *Event[testCtx, int]) error {
+		return errors.New("fail")
+	}
+
+	mw := WithEventHooks(hooks)(handler)
+	err := mw(testCtx{}, evt)
+
+	assert.Error(t, err)
+	assert.True(t, beforeCalled)
+	assert.False(t, afterCalled)
 }

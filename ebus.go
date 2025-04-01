@@ -6,6 +6,7 @@ package ebus
 import (
 	"encoding/binary"
 	"github.com/pkg/errors"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -219,6 +220,125 @@ func Dispatcher[T, ID any](ctx T, event *Event[T, ID]) error {
 	}
 	commitAll(ctx, event.Payloads)
 	return nil
+}
+
+type PayloadTypeNameHandler func(pt PayloadType) string
+
+func LoggingById[T any, ID any](logf func(format string, args ...any)) EventMiddleware[T, ID] {
+	return LoggingByTypeName[T, ID](func(pt PayloadType) string {
+		return strconv.FormatInt(int64(pt), 10)
+	}, logf)
+}
+
+func LoggingByTypeName[T any, ID any](payloadTypeNameHandler PayloadTypeNameHandler, logf func(format string, args ...any)) EventMiddleware[T, ID] {
+	return func(next EventHandler[T, ID]) EventHandler[T, ID] {
+		return func(ctx T, event *Event[T, ID]) error {
+			logf("→ Event %v started with %d payloads", event.ID, len(event.Payloads))
+			for _, p := range event.Payloads {
+				logf("   ↪ Payload type: %s", payloadTypeNameHandler(p.PayloadType()))
+			}
+
+			start := time.Now()
+			err := next(ctx, event)
+			duration := time.Since(start)
+
+			if err != nil {
+				logf("✖ Event %v failed after %s: %v", event.ID, duration, err)
+			} else {
+				logf("✓ Event %v handled successfully in %s", event.ID, duration)
+			}
+			return err
+		}
+	}
+}
+
+// RetryPolicy Interface
+type RetryPolicy interface {
+	ShouldRetry(attempt int, err error) bool
+	Backoff(attempt int) time.Duration
+}
+
+// RetryWithPolicy retries event dispatch based on a custom retry policy.
+// Allows for conditional retry logic and custom backoff strategies.
+func RetryWithPolicy[T, ID any](policy RetryPolicy) EventMiddleware[T, ID] {
+	return func(next EventHandler[T, ID]) EventHandler[T, ID] {
+		return func(ctx T, event *Event[T, ID]) error {
+			var err error
+			attempt := 0
+			for {
+				err = next(ctx, event)
+				if err == nil || !policy.ShouldRetry(attempt, err) {
+					return err
+				}
+				time.Sleep(policy.Backoff(attempt))
+				attempt++
+			}
+		}
+	}
+}
+
+// RetryFallbackHandler defines a function that receives failed events.
+type RetryFallbackHandler[T any, ID any] func(evt *Event[T, ID], err error)
+
+// RetryWithFallback retries event dispatch using a policy and calls fallback on failure.
+func RetryWithFallback[T, ID any](policy RetryPolicy, fallback RetryFallbackHandler[T, ID]) EventMiddleware[T, ID] {
+	return func(next EventHandler[T, ID]) EventHandler[T, ID] {
+		return func(ctx T, event *Event[T, ID]) error {
+			var err error
+			attempt := 0
+			for {
+				err = next(ctx, event)
+				if err == nil || !policy.ShouldRetry(attempt, err) {
+					break
+				}
+				time.Sleep(policy.Backoff(attempt))
+				attempt++
+			}
+			if err != nil && fallback != nil {
+				fallback(event, err)
+			}
+			return err
+		}
+	}
+}
+
+type EventHooks[T, ID any] struct {
+	OnBeforeHandle func(ctx T, event *Event[T, ID])
+	OnAfterCommit  func(ctx T, event *Event[T, ID])
+}
+
+// WithEventHooks allows injecting callbacks before handling and after committing an event.
+// Useful for logging, metrics, or tracing lifecycle stages.
+func WithEventHooks[T, ID any](hooks EventHooks[T, ID]) EventMiddleware[T, ID] {
+	return func(next EventHandler[T, ID]) EventHandler[T, ID] {
+		return func(ctx T, event *Event[T, ID]) error {
+			if hooks.OnBeforeHandle != nil {
+				hooks.OnBeforeHandle(ctx, event)
+			}
+			err := next(ctx, event)
+			if err == nil && hooks.OnAfterCommit != nil {
+				hooks.OnAfterCommit(ctx, event)
+			}
+			return err
+		}
+	}
+}
+
+// Retry middleware that forces the event to repeat when it fails
+func Retry[T, ID any](retries int, delay time.Duration) EventMiddleware[T, ID] {
+	return func(next EventHandler[T, ID]) EventHandler[T, ID] {
+		return func(ctx T, event *Event[T, ID]) error {
+			var err error
+			for i := 0; i < retries; i++ {
+				err = next(ctx, event)
+				if err == nil {
+					return nil
+				}
+				time.Sleep(delay)
+			}
+			return err
+		}
+	}
 }
 
 // validateAll checks if all payloads pass validation.
