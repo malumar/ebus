@@ -1,11 +1,6 @@
 .PHONY: test test-race bench bench-long vet lint ci
 
-GO      ?= go
-GOBIN   := $(shell $(GO) env GOBIN)
-ifeq ($(GOBIN),)
-GOBIN   := $(shell $(GO) env GOPATH)/bin
-endif
-STATICCHECK := $(GOBIN)/staticcheck
+GO ?= go
 
 
 test:
@@ -24,9 +19,6 @@ vet:
 	$(GO) vet ./...
 
 lint:
-	@command -v $(STATICCHECK) >/dev/null 2>&1 || { \
-		echo "Installing staticcheck..."; \
-		GOTOOLCHAIN=local CGO_ENABLED=0 $(GO) install honnef.co/go/tools/cmd/staticcheck@2024.1.1; \
-	}
-	$(STATICCHECK) -checks=all,-ST1006 ./...
+	GOTOOLCHAIN=local CGO_ENABLED=0 $(GO) run honnef.co/go/tools/cmd/staticcheck@2024.1.1 \
+	  -checks=all,-ST1006 ./...
 ci: test-race vet lint
