@@ -189,10 +189,6 @@ func BenchmarkPublish_NoTx_Parallel(b *testing.B) {
 
 // JSON decoder overhead (DisallowUnknownFields on)
 func BenchmarkDecode_JSON(b *testing.B) {
-	type decPayload struct {
-		Foo string `json:"foo"`
-		Bar int    `json:"bar"`
-	}
 	dec := NewJSONDecoder[any]()
 	dec.MustRegister(99, func() Payload[any] { return &jsonDecPayload{} })
 
