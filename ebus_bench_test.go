@@ -4,7 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- Benchmark Env / Tx / Payloads (stubs) ----------
@@ -76,6 +81,78 @@ func (p *jsonDecPayload) Handle(_ any) error       { return nil }
 func (p *jsonDecPayload) Commit(_ any)             {}
 func (p *jsonDecPayload) Rollback(_ any)           {}
 func (p *jsonDecPayload) PayloadType() PayloadType { return 99 }
+
+func fmtName(ts int64, pt int) string {
+	return fmt.Sprintf("%d_%d_%d.raw.pending", ts, pt, time.Now().UnixNano())
+}
+
+// ---------- I/O Tx (WAL fsync) for I/O benchmarks ----------
+type ioEnv struct{ dir string }
+type ioTx struct {
+	dir   string
+	files []string
+}
+
+func (e ioEnv) BeginTx(readonly bool) (Tx, error) { return &ioTx{dir: e.dir}, nil }
+func (t *ioTx) PutRaw(r *Raw[ID8Byte]) error {
+	if err := os.MkdirAll(t.dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	name := filepath.Join(t.dir, "bench_"+strings.TrimSuffix(string(r.Meta.CorrelationID[:]), "")+".raw.pending")
+	// Fallback: use event timestamp + type for uniqueness if correlation is zero
+	if r.Meta.TimestampUnix != 0 {
+		name = filepath.Join(t.dir, fmtName(int64(r.Meta.TimestampUnix), int(r.Type)))
+	}
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(r.Body); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil { // fsync file
+		_ = f.Close()
+		return err
+	}
+	_ = f.Close()
+	t.files = append(t.files, name)
+	return nil
+}
+func (t *ioTx) Commit() error {
+	for _, tmp := range t.files {
+		final := strings.TrimSuffix(tmp, ".pending")
+		if err := os.Rename(tmp, final); err != nil {
+			return err
+		}
+	}
+	// best-effort dir fsync
+	if d, err := os.Open(t.dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	t.files = nil
+	return nil
+}
+func (t *ioTx) Rollback() error {
+	for _, tmp := range t.files {
+		_ = os.Remove(tmp)
+	}
+	t.files = nil
+	return nil
+}
+
+// RAW payload for ioEnv
+type ioRawPayload struct {
+	RawPayload[ID8Byte]
+	cnt int
+}
+
+func (p *ioRawPayload) Validate(_ ioEnv) error   { return nil }
+func (p *ioRawPayload) Handle(_ ioEnv) error     { p.cnt++; return nil }
+func (p *ioRawPayload) Commit(_ ioEnv)           {}
+func (p *ioRawPayload) Rollback(_ ioEnv)         {}
+func (p *ioRawPayload) PayloadType() PayloadType { return 7 }
 
 // ---------- Helpers ----------
 
@@ -185,6 +262,77 @@ func BenchmarkPublish_NoTx_Parallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+// Tx path with I/O WAL (fsync) — realistic staging cost
+func BenchmarkPublish_Tx_WithRAW_IO(b *testing.B) {
+	dir, err := os.MkdirTemp("", "ebus_bench_io_*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	bus := NewWithTx(NewID8ByteHandler[ioEnv](0))
+	env := ioEnv{dir: dir}
+	cases := []int{1, 4}
+	for _, k := range cases {
+		b.Run("payloads="+itoa(k), func(b *testing.B) {
+			ps := make([]Payload[ioEnv], k)
+			rnd := make([]byte, 256)
+			_, _ = rand.Read(rnd)
+			for i := 0; i < k; i++ {
+				p := &ioRawPayload{}
+				p.SetRaw(&Raw[ID8Byte]{Type: 7, Body: rnd})
+				ps[i] = p
+			}
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := bus.PublishAll(env, ps); err != nil {
+					b.Fatalf("err: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Middleware overhead: Logging + Retry (successful path)
+func BenchmarkMiddleware_Logging_Retry_NoTx(b *testing.B) {
+	noop := func(string, ...any) {}
+	bus := NewDefault(NewID8ByteHandler[benchEnv](0),
+		LoggingByID[benchEnv, ID8Byte](noop),
+		Retry[benchEnv, ID8Byte](1, time.Nanosecond),
+	)
+	env := benchEnv{}
+	ps := makePayloadsNoTx(2)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := bus.PublishAll(env, ps); err != nil {
+			b.Fatalf("err: %v", err)
+		}
+	}
+}
+
+// End-to-end PublishRaws: Decode -> PublishAll with RawKeeper
+func BenchmarkPublishRaws_EndToEnd_Tx(b *testing.B) {
+	bus := NewWithTx(NewID8ByteHandler[benchTxEnv](0))
+	env := benchTxEnv{}
+	dec := NewJSONDecoder[benchTxEnv]()
+	dec.MustRegister(3, func() Payload[benchTxEnv] { return &benchRawPayload{} })
+	cases := []int{1, 4, 16}
+	body := []byte(`{}`)
+	for _, k := range cases {
+		b.Run("raws="+itoa(k), func(b *testing.B) {
+			raws := make([]Raw[ID8Byte], k)
+			for i := 0; i < k; i++ {
+				raws[i] = Raw[ID8Byte]{Type: 3, Body: body}
+			}
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := bus.PublishRaws(env, dec, raws...); err != nil {
+					b.Fatalf("err: %v", err)
+				}
+			}
+		})
+	}
 }
 
 // JSON decoder overhead (DisallowUnknownFields on)

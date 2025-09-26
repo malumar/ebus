@@ -1,6 +1,6 @@
 ## 📦 `ebus` – A Generic, Lightweight Event Bus for Go
 
-[![CI](https://github.com/<your-org>/ebus/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-org>/ebus/actions/workflows/ci.yml)
+[![CI](https://github.com/malumar/ebus/actions/workflows/go.yml/badge.svg)](https://github.com/malumar/ebus/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/malumar/ebus.svg)](https://pkg.go.dev/github.com/malumar/ebus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
@@ -665,7 +665,49 @@ go test ./...
 Your suite covers error handling, transactions, and rollback behavior.
 
 
+### Benchmarks
 
+How to run
+
+Unit tests with race detector:
+```bash
+go test ./... -race
+```
+
+Micro-benchmarks with memory stats:
+```bash
+go test -bench=. -benchmem ./...
+```
+
+Recommended flags for stability:
+```bash
+go test -bench=. -benchmem -benchtime=2s -count=5 ./...
+```
+
+Compare runs with benchstat:
+```bash
+go install golang.org/x/perf/cmd/benchstat@latest
+benchstat old.txt new.txt
+```
+
+Bench using makefile:
+
+- micro‑bench (CPU/mem),
+```bash
+make bench 
+```
+- more stable results (-benchtime=2s, -count=5),
+```bash
+make bench-long
+```
+- race detector,
+```bash
+make test-race
+```
+- staticcheck
+```bash
+make lint
+```
 ---
 
 ### ⚖️ License
