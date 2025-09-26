@@ -21,7 +21,7 @@ jobs:
       run: make bench
       
     - name: Run bench long
-      run: make bench long
+      run: make bench-long
       
     - name: Run vet
       run: make vet
