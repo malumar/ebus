@@ -392,7 +392,7 @@ func applyMiddleware[T, ID any](handler EventHandler[T, ID],
 	return handler
 }
 
-// Subscribe registers a CommitListener for the payload's type.
+// Subscribers registers a CommitListener for the payload's type.
 // The listener is invoked after a successful commit for matching payloads.
 //
 // Concurrency model:
@@ -581,7 +581,7 @@ func RetryWithContext[T any, ID any](retries int, delay time.Duration) EventMidd
 	}
 }
 
-// RetryWithPolicy retries dispatch according to the provided RetryPolicy,
+// RetryPolicy RetryWithPolicy retries dispatch according to the provided RetryPolicy,
 // sleeping according to Backoff between attempts and stopping when ShouldRetry returns false.
 type RetryPolicy interface {
 	ShouldRetry(attempt int, err error) bool

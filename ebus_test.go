@@ -817,7 +817,7 @@ func TestTx(t *testing.T) {
 	)
 
 	userData := UserCreate{Login: "marcin"}
-	raw := ToJson(userData)
+	raw := ToJSON(userData)
 
 	env := NewSimpleEnv(t.Logf)
 	if err := bus.PublishRaw(env, dec, userData.PayloadType(), raw); err != nil {
@@ -898,7 +898,7 @@ func TestCustomDispatchTx(t *testing.T) {
 	)
 
 	userData := UserCreate{Login: "marcin"}
-	raw := ToJson(userData)
+	raw := ToJSON(userData)
 
 	env := NewSimpleEnv(t.Logf)
 	if err := bus.PublishRaw(env, dec, userData.PayloadType(), raw); err != nil {
@@ -1097,7 +1097,7 @@ func TestValidateFail_NoHandleNoStaging_Dispatcher(t *testing.T) {
 
 // Tx call detection
 type countingTx struct {
-	beginCalled bool
+	//beginCalled bool
 	putRawCount int
 	rolledBack  bool
 	committed   bool
@@ -1217,7 +1217,7 @@ func TestHooks_InTx_AfterCommitOnlyOnSuccess(t *testing.T) {
 	assert.NoError(t, dec.Register(UserCreatePayload, func() Payload[Env] { return &UserCreate{} }))
 
 	// success
-	assert.NoError(t, bus.PublishRaw(env, dec, UserCreatePayload, ToJson(UserCreate{Login: "a", age: 10})))
+	assert.NoError(t, bus.PublishRaw(env, dec, UserCreatePayload, ToJSON(UserCreate{Login: "a", age: 10})))
 	// fail (ustawiamy age w Go, nie przez JSON)
 	assert.Error(t, bus.Publish(env, &UserCreate{Login: "b", age: 200}))
 
@@ -1349,9 +1349,6 @@ func TestDispatcher_Rollback_FirstPayloadFails(t *testing.T) {
 }
 
 // Env, which implements ContextCarrier
-type ctxEnv struct{ ctx context.Context }
-
-func (e ctxEnv) Context() context.Context { return e.ctx }
 
 type retryEnv struct{ ctx context.Context }
 
@@ -1405,7 +1402,7 @@ func TestSubscribers_Tx_CalledOnlyOnSuccess(t *testing.T) {
 	assert.NoError(t, dec.Register(UserCreatePayload, func() Payload[Env] { return &UserCreate{} }))
 
 	// success
-	assert.NoError(t, bus.PublishRaw(env, dec, UserCreatePayload, ToJson(UserCreate{Login: "ok", age: 10})))
+	assert.NoError(t, bus.PublishRaw(env, dec, UserCreatePayload, ToJSON(UserCreate{Login: "ok", age: 10})))
 	assert.Equal(t, 1, cnt)
 
 	// fail (Handle zwróci błąd, commit się nie wykona)
@@ -1469,7 +1466,7 @@ func TestTx_PanicRollback_OrderAndScope(t *testing.T) {
 	assert.Equal(t, []string{"handle:a", "handle:b", "rollback:b", "rollback:a"}, evs)
 }
 
-func ToJson(obj interface{}) []byte {
+func ToJSON(obj interface{}) []byte {
 	dat, err := json.Marshal(obj)
 	if err != nil {
 		return []byte(err.Error())
