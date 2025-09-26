@@ -179,8 +179,6 @@ func (self *SimpleEnv) PutRawX(payloadType PayloadType, raw []byte) error {
 	return nil
 }
 
-var randSeed = rand.New(rand.NewSource(time.Now().UnixNano()))
-
 func (self *SimpleEnv) Updater(handler func(stager Tx) error) error {
 	ss := SimpleTx{
 		data: []record{},
