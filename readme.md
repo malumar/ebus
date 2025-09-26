@@ -1,5 +1,7 @@
 ## 📦 `ebus` – A Generic, Lightweight Event Bus for Go
 
+
+[![CI](https://github.com/malumar/ebus/actions/workflows/codeql.yml/badge.svg)](https://github.com/malumar/ebus/actions/workflows/codeql.yml)
 [![CI](https://github.com/malumar/ebus/actions/workflows/go.yml/badge.svg)](https://github.com/malumar/ebus/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/malumar/ebus.svg)](https://pkg.go.dev/github.com/malumar/ebus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
