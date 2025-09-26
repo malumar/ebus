@@ -1,17 +1,23 @@
 package ebus
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"log"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 const (
-	UserPayload PayloadType = iota
+	UserCreatePayload PayloadType = iota
 	EventWithResultPayload
 )
 
@@ -24,17 +30,17 @@ func (self *EventWithResult) Result() int {
 	return self.randValue
 }
 
-func (self *EventWithResult) Validate(ctx AppCtx) error {
+func (self *EventWithResult) Validate(ctx Env) error {
 	if self.i == 0 {
 		return errors.New("invalid i value")
 	}
 	return nil
 }
-func (self *EventWithResult) Commit(ctx AppCtx) {
+func (self *EventWithResult) Commit(ctx Env) {
 	ctx.SetInt(self.i, self.randValue)
 }
 
-func (self *EventWithResult) Rollback(ctx AppCtx) {
+func (self *EventWithResult) Rollback(ctx Env) {
 	self.randValue = 0
 }
 
@@ -42,7 +48,7 @@ func (self *EventWithResult) PayloadType() PayloadType {
 	return EventWithResultPayload
 }
 
-func (self *EventWithResult) Handle(ctx AppCtx) error {
+func (self *EventWithResult) Handle(ctx Env) error {
 	self.randValue = rand.Intn(10)
 
 	if ctx.IntExists(self.i * self.randValue) {
@@ -51,13 +57,14 @@ func (self *EventWithResult) Handle(ctx AppCtx) error {
 	return nil
 }
 
-type UserData struct {
+type UserCreate struct {
+	RawPayload[ID8Byte]
 	Login    string
 	age      int
 	reserved bool
 }
 
-func (self *UserData) Validate(ctx AppCtx) error {
+func (self *UserCreate) Validate(ctx Env) error {
 	if self.Login == "" {
 		return fmt.Errorf("missing login")
 	}
@@ -68,11 +75,11 @@ func (self *UserData) Validate(ctx AppCtx) error {
 
 	return nil
 }
-func (self *UserData) Commit(ctx AppCtx) {
+func (self *UserCreate) Commit(ctx Env) {
 	ctx.Put(self.Login, self.age)
 }
 
-func (self *UserData) Rollback(ctx AppCtx) {
+func (self *UserCreate) Rollback(ctx Env) {
 
 	if self.reserved {
 		ctx.Logf("rolling back, delete user %s, exists = %v\n", self.Login, ctx.UserExists(self.Login))
@@ -80,24 +87,83 @@ func (self *UserData) Rollback(ctx AppCtx) {
 	}
 }
 
-func (self *UserData) PayloadType() PayloadType {
-	return UserPayload
+func (self *UserCreate) PayloadType() PayloadType {
+	return UserCreatePayload
 }
 
-func (self *UserData) Handle(ctx AppCtx) error {
+func (self *UserCreate) Handle(ctx Env) error {
+	// let's temporarily reserve a login for the time of commit
+	// Therefore, when undoing an operation, the system will know if it can safely delete
+	// can be used, for example, for chain payloads that can refer to the previous TX
+	// or you can also have e.g. shadow db in Env in which you store data until the commit
+	// and WithTx you finally merge databases or copy
 	self.reserved = self.age > 130
+
 	if self.reserved {
+		// We do a test, save the login in this case to the database, but we return an error
+		// The system will not add the record, because due to the error it will perform
+		// a rollback of the following operation
 		ctx.Put(self.Login, self.age)
 		return errors.New("not possible")
 	}
+
 	return nil
 }
 
-type SimpleCtx struct {
+func NewSimpleEnv(logf func(format string, args ...any)) *SimpleEnv {
+	return &SimpleEnv{
+		logf: logf,
+	}
+}
+
+type record struct {
+	PayloadType PayloadType
+	Data        []byte
+}
+type SimpleTx struct {
+	env  *SimpleEnv
+	data []record
+}
+
+func (s *SimpleTx) Commit() error {
+	if len(s.data) == 0 {
+		return errors.New("tx have no data")
+	}
+	s.env.Logf("Updater: saving to db")
+	for k, v := range s.data {
+		s.env.Logf("\t %d, %v %s", k+1, v.PayloadType, string(v.Data))
+	}
+
+	return nil
+}
+
+func (s *SimpleTx) Rollback() error {
+	return nil
+}
+func (s *SimpleTx) PutRaw(raw *Raw[ID8Byte]) error {
+	s.data = append(s.data, record{raw.Type, Clone(raw.Body)})
+	return nil
+}
+
+type SimpleEnv struct {
 	users map[string]*User
 	ints  map[int]int
-	bus   *Bus[AppCtx, ID8Byte]
+	bus   *Bus[Env, ID8Byte]
 	logf  func(format string, args ...any)
+}
+
+func (self *SimpleEnv) BeginTx(readonly bool) (Tx, error) {
+	if self.logf == nil {
+		return nil, errors.New("SimpleEnv must have assigned logf")
+	}
+	return &SimpleTx{
+		env: self,
+	}, nil
+}
+
+func (self *SimpleEnv) Rollback() {
+	//TODO implement me
+	panic("implement me")
 }
 
 type User struct {
@@ -105,10 +171,35 @@ type User struct {
 	Number int
 }
 
-func (self *SimpleCtx) Logf(format string, args ...any) {
+// fixme po co ta funkcja?? to jest duplikacja stagera?
+func (self *SimpleEnv) PutRawX(payloadType PayloadType, raw []byte) error {
+	self.Logf("db insert raw payload %v --> %v\n", payloadType, string(raw))
+	// simulate disk error
+
+	return nil
+}
+
+var randSeed = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func (self *SimpleEnv) Updater(handler func(stager Tx) error) error {
+	ss := SimpleTx{
+		data: []record{},
+	}
+	if err := handler(&ss); err != nil {
+		self.Logf("Updater: can't save data into db %v", err)
+		return err
+	} else {
+		self.Logf("Updater1: saving to db")
+		for k, v := range ss.data {
+			self.Logf("\t %d, %v %s", k+1, v.PayloadType, string(v.Data))
+		}
+	}
+	return nil
+}
+func (self *SimpleEnv) Logf(format string, args ...any) {
 	self.logf(format, args...)
 }
-func (self *SimpleCtx) UserExists(username string) bool {
+func (self *SimpleEnv) UserExists(username string) bool {
 	if self.users == nil {
 		return false
 	}
@@ -119,7 +210,7 @@ func (self *SimpleCtx) UserExists(username string) bool {
 	return false
 }
 
-func (self *SimpleCtx) SetInt(key, multiplier int) {
+func (self *SimpleEnv) SetInt(key, multiplier int) {
 	if self.ints == nil {
 		self.ints = make(map[int]int)
 	}
@@ -127,7 +218,7 @@ func (self *SimpleCtx) SetInt(key, multiplier int) {
 	self.ints[key] = key * multiplier
 }
 
-func (self *SimpleCtx) GetValue(key int) int {
+func (self *SimpleEnv) GetValue(key int) int {
 	if self.ints == nil {
 		return -1
 	}
@@ -139,7 +230,7 @@ func (self *SimpleCtx) GetValue(key int) int {
 	return -1
 }
 
-func (self *SimpleCtx) IntExists(key int) bool {
+func (self *SimpleEnv) IntExists(key int) bool {
 	if self.ints == nil {
 		return false
 	}
@@ -150,20 +241,20 @@ func (self *SimpleCtx) IntExists(key int) bool {
 	return false
 }
 
-func (self *SimpleCtx) DelInt(key int) {
+func (self *SimpleEnv) DelInt(key int) {
 	if self.ints != nil {
 		delete(self.ints, key)
 	}
 }
 
-func (self *SimpleCtx) DeleteUser(username string) {
+func (self *SimpleEnv) DeleteUser(username string) {
 	if self.users == nil {
 		return
 	}
 	delete(self.users, username)
 }
 
-func (self *SimpleCtx) Put(username string, value int) {
+func (self *SimpleEnv) Put(username string, value int) {
 	if self.users == nil {
 		self.users = make(map[string]*User)
 	}
@@ -174,69 +265,61 @@ func (self *SimpleCtx) Put(username string, value int) {
 
 }
 
-type AppCtx interface {
+type Env interface {
 	UserExists(username string) bool
 	DeleteUser(username string)
 	Put(username string, value int)
+	//PutRaw(payloadType PayloadType, raw []byte) error
 	SetInt(key, multiplier int)
 	DelInt(key int)
 	IntExists(key int) bool
 	Logf(format string, args ...any)
+	Transactional
 }
 
 func TestBus_IDGenError(t *testing.T) {
 	idGenErr := errors.New("id generator failure")
-	bus := NewDefault(func(AppCtx) (ID8Byte, error) {
+	bus := NewDefault(func(Env) (ID8Byte, error) {
 		return ID8Byte{}, idGenErr
 	})
-	ctx := &SimpleCtx{}
-	err := bus.Publish(ctx, []Payload[AppCtx]{
-		&UserData{Login: "xyz"},
-	})
+	env := NewSimpleEnv(t.Logf)
+	err := bus.Publish(env,
+		&UserCreate{Login: "xyz"},
+	)
 	assert.Equal(t, idGenErr, err)
 }
 
-func TestBus_EmptyPayloads(t *testing.T) {
-	bus := NewDefault(NewID8ByteHandler[AppCtx]())
-	ctx := &SimpleCtx{}
-
-	err := bus.Publish(ctx, []Payload[AppCtx]{})
-	assert.Equal(t, ErrEmptyPayloads, err)
-}
-
 func TestBus_RollbackOnHandleError(t *testing.T) {
-	bus := NewDefault(NewID8ByteHandler[AppCtx]())
-	ctx := &SimpleCtx{
-		logf: t.Logf,
-	}
-	err := bus.Publish(ctx, []Payload[AppCtx]{
-		&UserData{Login: "test", age: 150}, // Handle will return "not possible"
-	})
+	bus := NewDefault(NewID8ByteHandler[Env](0))
+	env := NewSimpleEnv(t.Logf)
+	err := bus.Publish(env,
+		&UserCreate{Login: "test", age: 150}, // Handle will return "not possible"
+	)
 	assert.EqualError(t, err, "not possible")
-	assert.False(t, ctx.UserExists("test"))
+	assert.False(t, env.UserExists("test"))
 }
 
 func TestBus_RunInvalidCommand(t *testing.T) {
-	bus := NewDefault(NewID8ByteHandler[AppCtx]())
-	ctx := &SimpleCtx{}
-	_, err := Run[AppCtx, ID8Byte, int](ctx, bus, []Payload[AppCtx]{
-		&UserData{Login: "test"},
-	})
+	bus := NewDefault(NewID8ByteHandler[Env](0))
+	env := NewSimpleEnv(t.Logf)
+	_, err := Run[Env, ID8Byte, int](env, bus,
+		&UserCreate{Login: "test"},
+	)
 	assert.Equal(t, ErrPayloadIsNotCommand, err)
 }
 
 func TestBus_Subscribe(t *testing.T) {
 
-	subs := NewSubscribers[AppCtx, ID8Byte]()
+	subs := NewSubscribers[Env, ID8Byte]()
 
-	bus := NewDefault(NewID8ByteHandler[AppCtx](), subs.Notifier(),
-		func(next EventHandler[AppCtx, ID8Byte]) EventHandler[AppCtx, ID8Byte] {
-			return func(ctx AppCtx, event *Event[AppCtx, ID8Byte]) error {
+	bus := NewDefault(NewID8ByteHandler[Env](0), subs.Notifier(),
+		func(next EventHandler[Env, ID8Byte]) EventHandler[Env, ID8Byte] {
+			return func(ctx Env, event *Event[Env, ID8Byte]) error {
 				err := next(ctx, event)
 				if err == nil {
 					var line string
 					for _, p := range event.Payloads {
-						if u, ok := p.(*UserData); ok {
+						if u, ok := p.(*UserCreate); ok {
 							if line != "" {
 								line += ", "
 							}
@@ -249,67 +332,66 @@ func TestBus_Subscribe(t *testing.T) {
 				return err
 			}
 		})
-	simpleCtx := &SimpleCtx{
+	simpleEnv := &SimpleEnv{
 		bus:  bus,
 		logf: t.Logf,
 	}
 
 	//
 
-	subs.Subscribe(&UserData{}, func(ctx AppCtx, payload Payload[AppCtx]) {
-		t.Log("Created user", payload.(*UserData).Login)
+	subs.Subscribe(&UserCreate{}, func(ctx Env, payload Payload[Env]) {
+		t.Log("Created user", payload.(*UserCreate).Login)
 	})
 
-	assert.NoError(t, bus.Publish(simpleCtx,
-		[]Payload[AppCtx]{
-			&UserData{age: 100, Login: "marcin"},
-			&UserData{Login: "janek"},
+	assert.NoError(t, bus.PublishAll(simpleEnv,
+		[]Payload[Env]{
+			&UserCreate{age: 100, Login: "marcin"},
+			&UserCreate{Login: "janek"},
 		}),
 	)
 
 	// tx fail
-	assert.EqualError(t, bus.Publish(simpleCtx,
-		[]Payload[AppCtx]{
-			&UserData{Login: "hieronim"},
-			&UserData{Login: "marcin"},
+	assert.EqualError(t, bus.PublishAll(simpleEnv,
+		[]Payload[Env]{
+			&UserCreate{Login: "hieronim"},
+			&UserCreate{Login: "marcin"},
 		}), "duplicated login marcin",
 	)
 
-	assert.False(t, simpleCtx.UserExists("hieronim"))
+	assert.False(t, simpleEnv.UserExists("hieronim"))
 
 	// tx success
-	assert.NoError(t, bus.Publish(simpleCtx,
-		[]Payload[AppCtx]{
-			&UserData{Login: "hieronim"},
-			&UserData{Login: "grażyna"},
+	assert.NoError(t, bus.PublishAll(simpleEnv,
+		[]Payload[Env]{
+			&UserCreate{Login: "hieronim"},
+			&UserCreate{Login: "grażyna"},
 		}),
 	)
-	assert.True(t, simpleCtx.UserExists("hieronim"))
-	assert.True(t, simpleCtx.UserExists("grażyna"))
+	assert.True(t, simpleEnv.UserExists("hieronim"))
+	assert.True(t, simpleEnv.UserExists("grażyna"))
 
-	assert.EqualError(t, bus.Publish(simpleCtx,
-		[]Payload[AppCtx]{
-			&UserData{age: 150, Login: "Håndtering av udøde"},
-		}), "not possible",
+	assert.EqualError(t, bus.Publish(simpleEnv,
+		&UserCreate{age: 150, Login: "Håndtering av udøde"},
+	), "not possible",
 	)
 
-	assert.False(t, simpleCtx.UserExists("Håndtering av udøde"))
+	assert.False(t, simpleEnv.UserExists("Håndtering av udøde"))
 
 	// the first event is not a command, throw error
-	_, err := Run[AppCtx, ID8Byte, int](simpleCtx, bus, []Payload[AppCtx]{
-		&UserData{Login: "julcia"},
+	_, err := RunAll[Env, ID8Byte, int](simpleEnv, bus, []Payload[Env]{
+		&UserCreate{Login: "julcia"},
 		&EventWithResult{i: 1},
 	})
 	assert.Equal(t, ErrPayloadIsNotCommand, err)
 
 	// An example of a correctly executed command, the result from the first event
 	val := 501
-	multiplier, err := Run[AppCtx, ID8Byte, int](simpleCtx, bus, []Payload[AppCtx]{
+	multiplier, err := RunAll[Env, ID8Byte, int](simpleEnv, bus, []Payload[Env]{
 		&EventWithResult{i: val},
-		&UserData{Login: "julcia"},
+		&UserCreate{Login: "julcia"},
 	})
 	assert.Nil(t, err)
-	assert.Equal(t, multiplier*val, simpleCtx.GetValue(val),
+	assert.Equal(t, multiplier*val, simpleEnv.GetValue(val),
 		"multiplier should be equal")
 }
 
@@ -391,7 +473,7 @@ func TestLoggingById(t *testing.T) {
 		Payloads: []Payload[testCtx]{&testPayload{payloadType: 1}},
 	}
 
-	logged := LoggingById[testCtx, int](logger)(func(ctx testCtx, e *Event[testCtx, int]) error {
+	logged := LoggingByID[testCtx, int](logger)(func(ctx testCtx, e *Event[testCtx, int]) error {
 		return nil
 	})
 
@@ -655,4 +737,744 @@ func TestWithEventHooks_OnlyBeforeCalledOnFailure(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, beforeCalled)
 	assert.False(t, afterCalled)
+}
+
+type FSRawStager[ID any] struct {
+	dir   string
+	files []string // staged pliki
+}
+
+func NewFSRawStager[ID any](dir string) *FSRawStager[ID] { return &FSRawStager[ID]{dir: dir} }
+
+func (s *FSRawStager[ID]) PutRaw(raw *Raw[ID]) error {
+	name := fmt.Sprintf("%v_%v_%d.raw.pending", raw.Type, raw.Meta.EventID, raw.Meta.TimestampUnix)
+
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
+		// Is the directory already exists?
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	}
+	tmp := filepath.Join(s.dir, name)
+	if err := os.WriteFile(tmp, raw.Body, 0o644); err != nil {
+		return err
+	}
+	// fdatasync + fsync directory welcome, omitted here for brevity
+	s.files = append(s.files, tmp)
+	return nil
+}
+
+func (s *FSRawStager[ID]) Commit() error {
+	for _, tmp := range s.files {
+		final := strings.TrimSuffix(tmp, ".pending")
+		if err := os.Rename(tmp, final); err != nil {
+			return err
+		}
+	}
+	s.files = nil
+	return nil
+}
+
+func (s *FSRawStager[ID]) Rollback() error {
+	for _, tmp := range s.files {
+		_ = os.Remove(tmp)
+	}
+	s.files = nil
+	return nil
+}
+
+type TxCtx[ID any] struct {
+	AppCtx Env
+	Stager *FSRawStager[ID]
+}
+
+type AEvent = Event[Env, ID8Byte]
+
+func TestTx(t *testing.T) {
+	// ID handler ebus – Twój istniejący
+	dec := NewJSONDecoder[Env]()
+
+	assert.NoError(t, dec.Register(UserCreatePayload, func() Payload[Env] {
+		return &UserCreate{}
+	}))
+	//
+
+	bus := NewWithTx(
+		NewID8ByteHandler[Env](0),
+		WithEventHooks[Env, ID8Byte](EventHooks[Env, ID8Byte]{
+			OnBeforeHandle: func(ctx Env, evt *AEvent) {
+				// e.g. tracinglog – you have access to the entire event and payloads
+				log.Printf("START id=%x payloads=%d", evt.ID, len(evt.Payloads))
+
+			},
+			OnAfterCommit: func(ctx Env, evt *AEvent) {
+				//will only be executed when everything has gone through and the transaction has been OK
+				log.Printf("COMMITTED id=%x", evt.ID)
+				// You can also fire up metrics, audit, etc.
+
+			},
+		}),
+
+		// ...here are your middleware: retry, logging, subscribers, etc.
+	)
+
+	userData := UserCreate{Login: "marcin"}
+	raw := ToJson(userData)
+
+	env := NewSimpleEnv(t.Logf)
+	if err := bus.PublishRaw(env, dec, userData.PayloadType(), raw); err != nil {
+		log.Fatal(err)
+	}
+
+}
+func TestCustomDispatchTx(t *testing.T) {
+	// ebus handler ID – your existing one
+	dec := NewJSONDecoder[Env]()
+
+	assert.NoError(t, dec.Register(UserCreatePayload, func() Payload[Env] {
+		return &UserCreate{}
+	}))
+	//
+
+	bus := New(
+		NewID8ByteHandler[Env](0),
+		func(env Env, event *Event[Env, ID8Byte]) error {
+
+			// 1) start a transaction in DB if you have one (optional)
+			// tx := db.Begin()
+			// ctx = ctxWithTx(ctx, tx)
+
+			if err := ValidateAll(env, event); err != nil {
+				return err
+			}
+
+			// 2) stager for the time of dispatch
+			st := NewFSRawStager[ID8Byte]("/tmp/wal-stage-test")
+			//tx := TxCtx[ID8Byte]{
+			//	Env: ctx,
+			//	Tx: st,
+			//}
+
+			nHandled, err := ApplyAllUnsafe(env, event, st)
+			if err != nil {
+				// Undo changes for all completed + currently incorrect
+				if e := st.Rollback(); e != nil {
+					env.Logf("Rollback error after  ApplyAllUnsafe %v", e)
+				}
+				RollbackRangeUnsafe(env, event, 0, nHandled+1)
+				return err
+			}
+
+			CommitAllUnsafe(env, event)
+
+			// 4) finalization: DB first, then stager (or vice versa – choose one order
+			// and stick to it)
+			// if err := tx.Commit(); err != nil {
+			//     _ = st.Rollback()
+			//     return err
+			// }
+
+			if err := st.Commit(); err != nil {
+				// optional: DB compensation, if the DB commit has already gone
+				return err
+			}
+
+			return nil
+
+		},
+		WithEventHooks[Env, ID8Byte](EventHooks[Env, ID8Byte]{
+			OnBeforeHandle: func(ctx Env, evt *AEvent) {
+				// e.g. tracinglog – you have access to the entire event and payload
+				log.Printf("START id=%x payloads=%d", evt.ID, len(evt.Payloads))
+
+			},
+			OnAfterCommit: func(ctx Env, evt *AEvent) {
+				// will only be executed when everything has gone through and the transaction has been OK
+				log.Printf("COMMITTED id=%x", evt.ID)
+				// You can also fire up metrics, audit, etc.
+
+			},
+		}),
+
+		// ...here are your middleware: retry, logging, subscribers, etc.
+	)
+
+	userData := UserCreate{Login: "marcin"}
+	raw := ToJson(userData)
+
+	env := NewSimpleEnv(t.Logf)
+	if err := bus.PublishRaw(env, dec, userData.PayloadType(), raw); err != nil {
+		log.Fatal(err)
+	}
+
+}
+
+// ------- Rollback tests helpers -------
+
+type recPayload struct {
+	RawPayload[ID8Byte]
+	id        string
+	pt        PayloadType
+	events    *[]string
+	handleErr error
+}
+
+func (p *recPayload) Validate(Env) error       { return nil }
+func (p *recPayload) PayloadType() PayloadType { return p.pt }
+func (p *recPayload) Handle(Env) error {
+	if p.events != nil {
+		*p.events = append(*p.events, "handle:"+p.id)
+	}
+	return p.handleErr
+}
+func (p *recPayload) Commit(Env) {
+	if p.events != nil {
+		*p.events = append(*p.events, "commit:"+p.id)
+	}
+}
+func (p *recPayload) Rollback(Env) {
+	if p.events != nil {
+		*p.events = append(*p.events, "rollback:"+p.id)
+	}
+}
+
+// Env-wrapper to inject your own Tx
+type txEnv struct {
+	*SimpleEnv
+	mkTx func() Tx
+}
+
+func (e txEnv) BeginTx(readonly bool) (Tx, error) { return e.mkTx(), nil }
+
+// TX, which always fails on PutRaw (staging)
+type stagingFailTx struct {
+	rolledBack bool
+}
+
+func (s *stagingFailTx) Commit() error                { return nil }
+func (s *stagingFailTx) Rollback() error              { s.rolledBack = true; return nil }
+func (s *stagingFailTx) PutRaw(_ *Raw[ID8Byte]) error { return errors.New("staging failed") }
+
+// TX, which fails on the Commit and saves whether the Rollback was called
+type commitFailTx struct {
+	rolledBack bool
+	staged     int
+}
+
+func (c *commitFailTx) Commit() error                { return errors.New("commit failed") }
+func (c *commitFailTx) Rollback() error              { c.rolledBack = true; return nil }
+func (c *commitFailTx) PutRaw(_ *Raw[ID8Byte]) error { c.staged++; return nil }
+
+// Rollback of the order on the Handle error (Dispatcher)
+func TestDispatcher_RollbackOrder_OnHandleError(t *testing.T) {
+	var evs []string
+	bus := NewDefault(NewID8ByteHandler[Env](0))
+	env := NewSimpleEnv(t.Logf)
+
+	a := &recPayload{id: "a", pt: 100, events: &evs}
+	b := &recPayload{id: "b", pt: 101, events: &evs}
+	c := &recPayload{id: "c", pt: 102, events: &evs, handleErr: errors.New("boom")}
+
+	err := bus.PublishAll(env, []Payload[Env]{a, b, c})
+	assert.EqualError(t, err, "boom")
+
+	// Handle: a, b; błąd na c -> rollback: c, b, a (odwrotna kolejność)
+	assert.Equal(t, []string{
+		"handle:a", "handle:b", "handle:c",
+		"rollback:c", "rollback:b", "rollback:a",
+	}, evs, "rollback should happen in reverse order and include failing payload")
+}
+
+// Rollback on PutRaw staging error (TxDispatcher) – before Handle
+func TestTx_Rollback_OnStagingError(t *testing.T) {
+	var evs []string
+
+	// Bus z TxDispatcher
+	bus := NewWithTx(NewID8ByteHandler[Env](0))
+
+	// Env, który zwraca stagingFailTx (PutRaw -> error)
+	env := txEnv{
+		SimpleEnv: NewSimpleEnv(t.Logf),
+		mkTx:      func() Tx { return &stagingFailTx{} },
+	}
+
+	// Decoder zwracający recPayload implementujący RawKeeper
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(200, func() Payload[Env] {
+		return &recPayload{id: "p0", pt: 200, events: &evs}
+	}))
+
+	// Minimalne RAW body
+	body := []byte(`{}`)
+
+	err := bus.PublishRaw(env, dec, 200, body)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "stage raw", "should propagate staging error")
+
+	// Since staging fails before Tx, our pipeline also calls a rollback for the first
+	// payload (+1), so we only expect a rollback (without a handlecommit).
+	assert.Equal(t, []string{
+		"rollback:p0",
+	}, evs, "failing payload should be rolled back even if Handle did not run (consistent +1 semantics)")
+}
+
+// Rollback on Commit() TX error – after successful Handle
+func TestTx_Rollback_OnCommitFailure(t *testing.T) {
+	var evs []string
+
+	cftx := &commitFailTx{}
+	env := txEnv{
+		SimpleEnv: NewSimpleEnv(t.Logf),
+		mkTx:      func() Tx { return cftx },
+	}
+
+	bus := NewWithTx(NewID8ByteHandler[Env](0))
+
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(201, func() Payload[Env] {
+		return &recPayload{id: "a", pt: 201, events: &evs}
+	}))
+	assert.NoError(t, dec.Register(202, func() Payload[Env] {
+		return &recPayload{id: "b", pt: 202, events: &evs}
+	}))
+
+	bodyA := []byte(`{}`)
+	bodyB := []byte(`{}`)
+
+	// We are publishing 2 payloads in one event – both will enter Tx,
+	// staging will pass; Commit TX will fail
+	err := bus.PublishRaws(env, dec,
+		Raw[ID8Byte]{Type: 201, Body: bodyA},
+		Raw[ID8Byte]{Type: 202, Body: bodyB},
+	)
+	assert.EqualError(t, err, "commit failed")
+
+	// We are publishing 2 payloads in one event – both will enter
+	// Tx, staging will pass; Commit TX will fail
+	assert.Equal(t, []string{
+		"handle:a", "handle:b",
+		"rollback:b", "rollback:a",
+	}, evs, "should rollback all handled payloads in reverse order on commit failure")
+
+	// In addition: we check that tx. Rollback was triggered after a failed Commit
+	assert.True(t, cftx.rolledBack, "tx.Rollback should be called after commit failure")
+}
+
+// --- Validate fail: brak stagingu, brak TX, brak handlerollback ---
+// Validate: No Handle, No Staging, No TX on Validation Error
+// Dispatcher: should not call Handle/Commit/Rollback.
+// TxDispatcher: Validate fail before BeginTx – BeginTx should not be invoked, PutRaw should not be invoked.
+type validateFailPayload struct {
+	calls *[]string
+}
+
+func (p *validateFailPayload) Validate(Env) error { return errors.New("validate fail") }
+func (p *validateFailPayload) Handle(Env) error {
+	if p.calls != nil {
+		*p.calls = append(*p.calls, "handle")
+	}
+	return nil
+}
+func (p *validateFailPayload) Commit(Env) {
+	if p.calls != nil {
+		*p.calls = append(*p.calls, "commit")
+	}
+}
+func (p *validateFailPayload) Rollback(Env) {
+	if p.calls != nil {
+		*p.calls = append(*p.calls, "rollback")
+	}
+}
+func (p *validateFailPayload) PayloadType() PayloadType { return 300 }
+
+func TestValidateFail_NoHandleNoStaging_Dispatcher(t *testing.T) {
+	var calls []string
+	bus := NewDefault(NewID8ByteHandler[Env](0))
+	env := NewSimpleEnv(t.Logf)
+
+	err := bus.Publish(env, &validateFailPayload{calls: &calls})
+	assert.EqualError(t, err, "validate fail")
+	assert.Equal(t, 0, len(calls), "no handle/commit/rollback on validate fail")
+}
+
+// Tx call detection
+type countingTx struct {
+	beginCalled bool
+	putRawCount int
+	rolledBack  bool
+	committed   bool
+}
+
+func (tx *countingTx) Commit() error                { tx.committed = true; return nil }
+func (tx *countingTx) Rollback() error              { tx.rolledBack = true; return nil }
+func (tx *countingTx) PutRaw(_ *Raw[ID8Byte]) error { tx.putRawCount++; return nil }
+
+func TestValidateFail_NoBeginTxNoStaging_TxDispatcher(t *testing.T) {
+	var beginCounter int
+	var calls []string
+
+	tx := &countingTx{}
+	env := txEnv{
+		SimpleEnv: NewSimpleEnv(t.Logf),
+		mkTx: func() Tx {
+			beginCounter++
+			return tx
+		},
+	}
+	bus := NewWithTx(NewID8ByteHandler[Env](0))
+
+	err := bus.Publish(env, &validateFailPayload{calls: &calls})
+	assert.EqualError(t, err, "validate fail")
+	assert.Equal(t, 0, len(calls))
+	assert.Equal(t, 0, beginCounter, "BeginTx must not be called if Validate fails")
+	assert.Equal(t, 0, tx.putRawCount, "no staging on validate fail")
+	assert.False(t, tx.rolledBack)
+	assert.False(t, tx.committed)
+}
+
+// Mixed payloads without RawKeeper: staging only for RawKeeper, meta set Payload without RawKeeper
+type noRawPayload struct {
+	id    string
+	calls *[]string
+	pt    PayloadType
+}
+
+func (p *noRawPayload) Validate(Env) error { return nil }
+func (p *noRawPayload) Handle(Env) error {
+	if p.calls != nil {
+		*p.calls = append(*p.calls, "handle:"+p.id)
+	}
+	return nil
+}
+func (p *noRawPayload) Commit(Env)               {}
+func (p *noRawPayload) Rollback(Env)             {}
+func (p *noRawPayload) PayloadType() PayloadType { return p.pt }
+
+// RAW Capture Stager
+type capturingTx struct {
+	staged []*Raw[ID8Byte]
+}
+
+func (c *capturingTx) Commit() error                { return nil }
+func (c *capturingTx) Rollback() error              { return nil }
+func (c *capturingTx) PutRaw(r *Raw[ID8Byte]) error { c.staged = append(c.staged, r); return nil }
+
+func TestMixedPayloads_StagingOnlyForRawKeeper_MetaSet(t *testing.T) {
+	cap := &capturingTx{}
+	env := txEnv{
+		SimpleEnv: NewSimpleEnv(t.Logf),
+		mkTx:      func() Tx { return cap },
+	}
+	bus := NewWithTx(NewID8ByteHandler[Env](0))
+
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(400, func() Payload[Env] { return &recPayload{id: "raw", pt: 400} }))
+	assert.NoError(t, dec.Register(401, func() Payload[Env] { return &noRawPayload{id: "nraw", pt: 401} }))
+
+	err := bus.PublishRaws(env, dec,
+		Raw[ID8Byte]{Type: 400, Body: []byte(`{}`)},
+		Raw[ID8Byte]{Type: 401, Body: []byte(`{}`)},
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(cap.staged), "only RawKeeper payload should be staged")
+	st := cap.staged[0]
+	assert.NotNil(t, st)
+	assert.Equal(t, PayloadType(400), st.Type)
+	assert.NotZero(t, st.Meta.TimestampUnix)
+}
+
+// Subscribers are not invoked on an error; are triggered by success
+func TestSubscribers_CalledOnlyOnSuccess(t *testing.T) {
+	var cnt int
+	subs := NewSubscribers[Env, ID8Byte]()
+	subs.Subscribe(&UserCreate{}, func(ctx Env, p Payload[Env]) { cnt++ })
+
+	bus := NewDefault(NewID8ByteHandler[Env](0), subs.Notifier())
+	env := NewSimpleEnv(t.Logf)
+
+	// fail
+	err := bus.PublishAll(env, []Payload[Env]{
+		&UserCreate{Login: "dup", age: 200}, // Handle returns "not possible"
+	})
+	assert.Error(t, err)
+	assert.Equal(t, 0, cnt)
+
+	// success
+	assert.NoError(t, bus.PublishAll(env, []Payload[Env]{
+		&UserCreate{Login: "ok1", age: 20},
+	}))
+	assert.Equal(t, 1, cnt)
+}
+
+// Hooks in the transaction path: OnAfterCommit only on success
+func TestHooks_InTx_AfterCommitOnlyOnSuccess(t *testing.T) {
+	var before, after int
+	h := WithEventHooks[Env, ID8Byte](EventHooks[Env, ID8Byte]{
+		OnBeforeHandle: func(ctx Env, e *Event[Env, ID8Byte]) { before++ },
+		OnAfterCommit:  func(ctx Env, e *Event[Env, ID8Byte]) { after++ },
+	})
+	bus := NewWithTx(NewID8ByteHandler[Env](0), h)
+	env := NewSimpleEnv(t.Logf)
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(UserCreatePayload, func() Payload[Env] { return &UserCreate{} }))
+
+	// success
+	assert.NoError(t, bus.PublishRaw(env, dec, UserCreatePayload, ToJson(UserCreate{Login: "a", age: 10})))
+	// fail (ustawiamy age w Go, nie przez JSON)
+	assert.Error(t, bus.Publish(env, &UserCreate{Login: "b", age: 200}))
+
+	assert.Equal(t, 2, before)
+	assert.Equal(t, 1, after)
+}
+
+// flakyCmd Retry + Tx: two attempts failed (Tx), third successful; Commit and subscribers called once
+type flakyCmd struct {
+	RawPayload[ID8Byte]
+	pt       PayloadType
+	attempts *int
+	failFor  int
+}
+
+func (c *flakyCmd) Validate(Env) error       { return nil }
+func (c *flakyCmd) PayloadType() PayloadType { return c.pt }
+func (c *flakyCmd) Handle(Env) error {
+	*c.attempts++
+	if *c.attempts <= c.failFor {
+		return errors.New("transient")
+	}
+	return nil
+}
+func (c *flakyCmd) Commit(Env)   {}
+func (c *flakyCmd) Rollback(Env) {}
+func TestRetryWithTx_SucceedsAfterRetries(t *testing.T) {
+	attempts := 0
+	subs := NewSubscribers[Env, ID8Byte]()
+	var committed int
+	subs.Subscribe(&flakyCmd{pt: 500}, func(ctx Env, p Payload[Env]) { committed++ })
+
+	bus := NewWithTx(NewID8ByteHandler[Env](0),
+		Retry[Env, ID8Byte](5, 5*time.Millisecond),
+		subs.Notifier(),
+	)
+	env := NewSimpleEnv(t.Logf)
+
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(500, func() Payload[Env] {
+		return &flakyCmd{pt: 500, attempts: &attempts, failFor: 2}
+	}))
+
+	// we use RAW to enable staging and not get "tx have no data"
+	assert.NoError(t, bus.PublishRaw(env, dec, 500, []byte(`{}`)))
+	assert.Equal(t, 3, attempts)
+	assert.Equal(t, 1, committed)
+}
+
+// JSONDecoder – unknown type i unknown field
+func TestJSONDecoder_UnknownType(t *testing.T) {
+	dec := NewJSONDecoder[Env]()
+	_, err := dec.Decode(9999, []byte(`{}`))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown payload type")
+}
+
+type xPayload struct {
+	Foo string `json:"foo"`
+}
+
+func (x *xPayload) Validate(Env) error       { return nil }
+func (x *xPayload) Handle(Env) error         { return nil }
+func (x *xPayload) Commit(Env)               {}
+func (x *xPayload) Rollback(Env)             {}
+func (x *xPayload) PayloadType() PayloadType { return 600 }
+
+func TestJSONDecoder_DisallowUnknownFields(t *testing.T) {
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(600, func() Payload[Env] { return &xPayload{} }))
+	_, err := dec.Decode(600, []byte(`{"foo":"bar","unknown":true}`))
+	assert.Error(t, err, "unknown field should cause error due to DisallowUnknownFields")
+}
+
+// panicPayload Recovery – Dispatcher (middleware) and TxDispatcher (built-in recover)
+type panicPayload struct{}
+
+func (p *panicPayload) Validate(Env) error       { return nil }
+func (p *panicPayload) Handle(Env) error         { panic("boom") }
+func (p *panicPayload) Commit(Env)               {}
+func (p *panicPayload) Rollback(Env)             {}
+func (p *panicPayload) PayloadType() PayloadType { return 700 }
+
+func TestRecoveryMiddleware_Dispatcher_PanicToError(t *testing.T) {
+	bus := NewDefault(NewID8ByteHandler[Env](0), Recovery[Env, ID8Byte](t.Logf))
+	env := NewSimpleEnv(t.Logf)
+	err := bus.Publish(env, &panicPayload{})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "panic:")
+}
+
+// rbTx TX that marks the rollback
+type rbTx struct{ rolledBack, did bool }
+
+func (r *rbTx) Commit() error                { return nil }
+func (r *rbTx) Rollback() error              { r.did = true; r.rolledBack = true; return nil }
+func (r *rbTx) PutRaw(_ *Raw[ID8Byte]) error { return nil }
+
+func TestTxDispatcher_PanicToError_WithRollback(t *testing.T) {
+	// Ugly hack just for testing, tx is always the same
+	rb := &rbTx{}
+	env := txEnv{
+		SimpleEnv: NewSimpleEnv(t.Logf),
+		mkTx:      func() Tx { return rb },
+	}
+	bus := NewWithTx(NewID8ByteHandler[Env](0))
+	err := bus.Publish(env, &panicPayload{})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "panic:")
+
+	assert.True(t, rb.rolledBack, "tx.rollback should be called on panic in TxDispatcher")
+}
+
+// TestDispatcher_Rollback_FirstPayloadFails Rollback limits – fail at index 0 (first)
+func TestDispatcher_Rollback_FirstPayloadFails(t *testing.T) {
+	var evs []string
+	bus := NewDefault(NewID8ByteHandler[Env](0))
+	env := NewSimpleEnv(t.Logf)
+
+	a := &recPayload{id: "a", pt: 801, events: &evs, handleErr: errors.New("boom")}
+	b := &recPayload{id: "b", pt: 802, events: &evs}
+
+	err := bus.PublishAll(env, []Payload[Env]{a, b})
+	assert.EqualError(t, err, "boom")
+	assert.Equal(t, []string{
+		"handle:a",
+		"rollback:a",
+	}, evs)
+}
+
+// Env, which implements ContextCarrier
+type ctxEnv struct{ ctx context.Context }
+
+func (e ctxEnv) Context() context.Context { return e.ctx }
+
+type retryEnv struct{ ctx context.Context }
+
+func (e retryEnv) Context() context.Context { return e.ctx }
+
+// Minimal payload bound to retryEnv
+type retryPayload struct{}
+
+func (p *retryPayload) Validate(retryEnv) error  { return nil }
+func (p *retryPayload) Handle(retryEnv) error    { return errors.New("transient") }
+func (p *retryPayload) Commit(retryEnv)          {}
+func (p *retryPayload) Rollback(retryEnv)        {}
+func (p *retryPayload) PayloadType() PayloadType { return 0 }
+func TestRetryWithContext_CancelStopsRetries(t *testing.T) {
+	// Env type used by this test implements ContextCarrier
+
+	attempts := 0
+	handler := func(env retryEnv, e *Event[retryEnv, int]) error {
+		attempts++
+		return errors.New("transient")
+	}
+
+	evt := &Event[retryEnv, int]{
+		ID:       1,
+		Payloads: []Payload[retryEnv]{&retryPayload{}},
+	}
+
+	// Short timeout so cancel happens before all retries
+	cctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	env := retryEnv{ctx: cctx}
+
+	// delay > timeout to guarantee we hit the cancel path
+	mw := RetryWithContext[retryEnv, int](10, 50*time.Millisecond)
+	err := mw(handler)(env, evt)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "canceled:")
+	assert.Less(t, attempts, 10, "retries should stop on context cancel/timeout")
+}
+
+// Test: Subscribers in the Tx path – calls only after commit
+func TestSubscribers_Tx_CalledOnlyOnSuccess(t *testing.T) {
+	subs := NewSubscribers[Env, ID8Byte]()
+	cnt := 0
+	subs.Subscribe(&UserCreate{}, func(ctx Env, p Payload[Env]) { cnt++ })
+
+	bus := NewWithTx(NewID8ByteHandler[Env](0), subs.Notifier())
+	env := NewSimpleEnv(t.Logf)
+	dec := NewJSONDecoder[Env]()
+	assert.NoError(t, dec.Register(UserCreatePayload, func() Payload[Env] { return &UserCreate{} }))
+
+	// success
+	assert.NoError(t, bus.PublishRaw(env, dec, UserCreatePayload, ToJson(UserCreate{Login: "ok", age: 10})))
+	assert.Equal(t, 1, cnt)
+
+	// fail (Handle zwróci błąd, commit się nie wykona)
+	err := bus.Publish(env, &UserCreate{Login: "dup", age: 200})
+	assert.Error(t, err)
+	assert.Equal(t, 1, cnt, "no new notifications on failure")
+}
+
+// PublishRaws – edge cases: Blank input and decoding error
+
+func TestPublishRaws_Empty_NoOp(t *testing.T) {
+	bus := NewDefault(NewID8ByteHandler[testCtx](0))
+	env := testCtx{}
+	dec := NewJSONDecoder[testCtx]()
+	err := bus.PublishRaws(env, dec /* no raws */)
+	assert.NoError(t, err)
+}
+
+func TestPublishRaws_DecodeError_NoProcessing(t *testing.T) {
+	// decoder does not know type 42 -> decode will return an error
+	bus := NewDefault(NewID8ByteHandler[testCtx](0))
+	env := testCtx{}
+	dec := NewJSONDecoder[testCtx]()
+
+	// payload that would fail in Tx, but we shouldn't get to Handle
+	raws := []Raw[ID8Byte]{{Type: 42, Body: []byte(`{malformed`)}}
+
+	err := bus.PublishRaws(env, dec, raws...)
+	assert.Error(t, err)
+	// no side-effects for assertion (in our case testCtx is empty),
+	// but the lack of panic and error alone are enough
+}
+
+// Test: panic-rollback with recPayload – rollback precision
+type panicRecPayload struct {
+	recPayload
+	panicOnHandle bool
+}
+
+func (p *panicRecPayload) Handle(Env) error {
+	if p.events != nil {
+		*p.events = append(*p.events, "handle:"+p.id)
+	}
+	if p.panicOnHandle {
+		panic("boom")
+	}
+	return nil
+}
+
+func TestTx_PanicRollback_OrderAndScope(t *testing.T) {
+	var evs []string
+	env := txEnv{SimpleEnv: NewSimpleEnv(t.Logf), mkTx: func() Tx { return &commitFailTx{} }}
+	bus := NewWithTx(NewID8ByteHandler[Env](0))
+
+	a := &panicRecPayload{recPayload: recPayload{id: "a", pt: 901, events: &evs}}
+	b := &panicRecPayload{recPayload: recPayload{id: "b", pt: 902, events: &evs}, panicOnHandle: true}
+	err := bus.PublishAll(env, []Payload[Env]{a, b})
+
+	assert.Error(t, err)
+	// oczekujemy: handle a, handle b (panika), rollback b, rollback a
+	assert.Equal(t, []string{"handle:a", "handle:b", "rollback:b", "rollback:a"}, evs)
+}
+
+func ToJson(obj interface{}) []byte {
+	dat, err := json.Marshal(obj)
+	if err != nil {
+		return []byte(err.Error())
+	}
+	return dat
 }
