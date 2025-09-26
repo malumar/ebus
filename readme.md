@@ -3,6 +3,12 @@
 
 [![CI](https://github.com/malumar/ebus/actions/workflows/codeql.yml/badge.svg)](https://github.com/malumar/ebus/actions/workflows/codeql.yml)
 [![CI](https://github.com/malumar/ebus/actions/workflows/makefile.yml/badge.svg)](https://github.com/malumar/ebus/actions/workflows/makefile.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/malumar/ebus)](https://goreportcard.com/report/github.com/malumar/ebus)
+[![codecov](https://codecov.io/gh/malumar/ebus/branch/main/graph/badge.svg)](https://codecov.io/gh/malumar/ebus)
+[![codecov](https://codecov.io/gh/malumar/ebus/branch/main/graph/badge.svg)](https://codecov.io/gh/malumar/ebus)
+
+![Go Version](https://img.shields.io/github/go-mod/go-version/malumar/ebus)
+![GitHub last commit](https://img.shields.io/github/last-commit/malumar/ebus)
 [![CI](https://github.com/malumar/ebus/actions/workflows/go.yml/badge.svg)](https://github.com/malumar/ebus/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/malumar/ebus.svg)](https://pkg.go.dev/github.com/malumar/ebus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)

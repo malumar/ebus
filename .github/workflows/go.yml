@@ -24,6 +24,18 @@ jobs:
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
           staticcheck -checks=all,-ST1006 ./...
+
+      - name: Install dependencies
+        run: go mod tidy
+
+      - name: Run tests with coverage
+        run: go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          fail_ci_if_error: true
   bench:
     runs-on: ubuntu-latest
     steps:
