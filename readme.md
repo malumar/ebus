@@ -1,5 +1,9 @@
 ## 📦 `ebus` – A Generic, Lightweight Event Bus for Go
 
+[![CI](https://github.com/<your-org>/ebus/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-org>/ebus/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/malumar/ebus.svg)](https://pkg.go.dev/github.com/malumar/ebus)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 `ebus` is a highly extensible, type-safe event bus library for Go with full lifecycle support for events: validation, handling, rollback, commit, and optional transaction dispatch.
 
 Designed to be clean, flexible, and generic using Go's type parameters.
@@ -461,6 +465,195 @@ for i := to - 1; i >= from; i-- {
 ev.Payloads[i].Rollback(env)
 }
 }
+```
+
+### Concurrency, ordering, and isolation
+
+#### Thread-safety
+
+Bus is safe for concurrent use. You can call Publish/PublishAll from multiple goroutines.
+The default ID generator (NewID8ByteHandler) is thread-safe (atomics).
+Your components must be safe under concurrency in the way you use them:
+ - idGenHandler (if custom),
+ - Env/State (especially Transactional.BeginTx),
+ - Tx implementations (Commit/Rollback/PutRaw),
+ - Decoder/Registry (register types at startup; read-only at runtime),
+ - Payload code (Validate/Handle/Commit/Rollback).
+Subscribers: Subscribe should be called during startup; after that the subscriber map is treated as immutable, so Notifier can be used concurrently without locks.
+
+#### Ordering guarantees
+
+- Within one event: payloads run in order (Validate all → for each payload: optional PutRaw → Handle; after success Commit all).
+- Across events: no global ordering is guaranteed. Concurrent Publish calls may interleave. If you need FIFO or per-key ordering, serialize at the caller or introduce a keyed dispatcher (e.g., a shard-per-key worker pool).
+
+#### Isolation model
+
+- ebus does not impose a transaction isolation level; it relies on your Tx implementation (database/WAL) and any in-memory coordination you add (locks, sharding, single-thread-per-partition).
+- Retries (Retry/RetryWithContext/RetryWithPolicy) will re-invoke the handler; re-executions can interleave with other events unless you serialize them.
+- Subscribers (post-commit) run after a successful event and are outside of the event transaction boundary; they should not mutate transactional state.
+#### Patterns for strict ordering
+
+- Per-key serialization: route events by a partition key to a single worker goroutine (channel) to guarantee per-key FIFO.
+- Sharding: N workers, each responsible for a shard (hash(key) % N). Within a shard you get ordering; across shards you get parallelism.
+
+Example outline:
+```go
+
+type ShardedDispatcher[T any, ID any] struct {
+    shards []chan *ebus.Event[T, ID]
+}
+
+func NewShardedDispatcher[T any, ID any](n int, bus *ebus.Bus[T, ID]) *ShardedDispatcher[T, ID] {
+    sd := &ShardedDispatcher[T, ID]{shards: make([]chan *ebus.Event[T, ID], n)}
+    for i := 0; i < n; i++ {
+        sd.shards[i] = make(chan *ebus.Event[T, ID], 1024)
+        go func(ch <-chan *ebus.Event[T, ID]) {
+            for evt := range ch {
+                _ = bus.Apply(/* env */, evt) // or PublishAll via wrapper
+            }
+        }(sd.shards[i])
+    }
+    return sd
+}
+
+func (sd *ShardedDispatcher[T, ID]) Enqueue(key string, evt *ebus.Event[T, ID]) {
+    i := fnv32a(key) % uint32(len(sd.shards))
+    sd.shards[i] <- evt
+}
+```
+This pattern guarantees per‑key FIFO within a shard while allowing concurrency across keys.
+
+### Error policy for payload Commit/Rollback
+Payload.Commit(env T) and Payload.Rollback(env T) do not return errors by design. This is intentional:
+
+- Commit and Rollback should be best-effort, side-effect–free finalizers (Commit) and compensations (Rollback).
+- If something goes wrong inside Commit or Rollback, the payload code should handle it locally (log, metrics, best-effort fixes) and never crash the process.
+
+Recommended reporting patterns
+
+- Log and metrics inside Commit/Rollback:
+  - Use your Env to log (e.g., env.Logf) and emit metrics. Consider adding IDs to logs (EventID can be read from RawKeeper if you use RAWs).
+- Use hooks for visibility:
+  - OnAfterCommit is invoked after a successful event (i.e., after all payload Commit calls): ideal to confirm completion or emit “commit succeeded” metrics.
+  - For Rollback visibility, add logging inside your Rollback implementations. If you need a global counter, you can wrap RollbackRangeUnsafe or emit metrics from the TxDispatcher error path (custom middleware).
+- Panic safety:
+  - If Commit/Rollback panic, TxDispatcher (Tx path) will convert panic to error and roll back TX and payloads. For the non-Tx path (Dispatcher), add the Recovery middleware.
+
+Optional API extension (roadmap)
+
+- If you want to surface Commit/Rollback failures in a structured way, consider extending EventHooks with:
+    - OnCommitError(env, event, payload, info string)
+    - OnRollbackError(env, event, payload, info string)
+- Until then, log/metrics inside payloads and use OnAfterCommit for success signals.
+
+
+Example (pattern inside a payload)
+
+
+```go
+func (p *UserCreate) Commit(env AppState) {
+    if err := p.persistIndex(env); err != nil {
+        env.Logf("commit: failed to persist index for %s: %v", p.Login, err)
+        // optionally emit metrics; do not return or panic
+    }
+}
+func (p *UserCreate) Rollback(env AppState) {
+    if err := p.undoReservation(env); err != nil {
+        env.Logf("rollback: failed to undo reservation for %s: %v", p.Login, err)
+    }
+}
+```
+
+### End-to-end TX/WAL example (Stager + RetryWithFallback → dead-letter)
+The snippet below shows:
+
+- a Tx implementation that stages RAW to a WAL (PutRaw),
+- Commit can fail (simulated) to demonstrate rollback,
+- RetryWithFallback routes failed events to a dead-letter sink.
+
+```go
+type DeadLetterSink interface {
+    Put(evt any, err error)
+}
+
+type WALTx struct {
+    dir   string
+    files []string // staged files
+    failCommit bool
+}
+
+func (tx *WALTx) PutRaw(r *ebus.Raw[ebus.ID8Byte]) error {
+    name := fmt.Sprintf("%v_%x_%d.raw.pending", r.Type, r.Meta.EventID, r.Meta.TimestampUnix)
+    path := filepath.Join(tx.dir, name)
+    if err := os.MkdirAll(tx.dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+        return err
+    }
+    if err := os.WriteFile(path, r.Body, 0o644); err != nil {
+        return err
+    }
+    tx.files = append(tx.files, path)
+    return nil
+}
+
+func (tx *WALTx) Commit() error {
+    if tx.failCommit {
+        return errors.New("commit failed")
+    }
+    for _, tmp := range tx.files {
+        final := strings.TrimSuffix(tmp, ".pending")
+        if err := os.Rename(tmp, final); err != nil {
+            return err
+        }
+    }
+    tx.files = nil
+    return nil
+}
+
+func (tx *WALTx) Rollback() error {
+    for _, tmp := range tx.files {
+        _ = os.Remove(tmp)
+    }
+    tx.files = nil
+    return nil
+}
+
+type EnvWithTx struct {
+    walDir string
+    // add logging/metrics as needed
+}
+
+func (e EnvWithTx) BeginTx(readonly bool) (ebus.Tx, error) {
+    return &WALTx{dir: e.walDir}, nil
+}
+
+// Build a bus with RetryWithFallback -> dead-letter
+func BuildBus(idGen ebus.IDGenHandler[EnvWithTx, ebus.ID8Byte], sink DeadLetterSink) *ebus.Bus[EnvWithTx, ebus.ID8Byte] {
+    policy := &ExpoJitterPolicy{Base: 10*time.Millisecond, Factor: 2, Max: 500*time.Millisecond}
+    dlq := func(evt *ebus.Event[EnvWithTx, ebus.ID8Byte], err error) {
+        // minimal snapshot for the sink
+        payloadTypes := make([]ebus.PayloadType, len(evt.Payloads))
+        for i, p := range evt.Payloads {
+            payloadTypes[i] = p.PayloadType()
+        }
+        sink.Put(struct {
+            ID       ebus.ID8Byte
+            Payloads []ebus.PayloadType
+            Err      string
+        }{ID: evt.ID, Payloads: payloadTypes, Err: err.Error()}, err)
+    }
+    return ebus.NewWithTx(
+        idGen,
+        ebus.RetryWithFallback[EnvWithTx, ebus.ID8Byte](policy, dlq),
+        ebus.Recovery[EnvWithTx, ebus.ID8Byte](log.Printf), // safety for non-Tx path
+    )
+}
+```
+
+Notes:
+
+- Stager.PutRaw is invoked before Handle for RAW-bearing payloads (RawKeeper).
+- If Commit fails, ebus rolls back payloads (reverse order) and calls tx.Rollback.
+- RetryWithFallback will retry according to policy and push the final failure to the dead-letter sink.
 
 ### 🧪 Testing
 
@@ -469,8 +662,9 @@ Run all tests:
 ```bash
 go test ./...
 ```
-
 Your suite covers error handling, transactions, and rollback behavior.
+
+
 
 ---
 
